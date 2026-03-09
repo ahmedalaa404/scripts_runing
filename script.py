@@ -1048,6 +1048,8 @@ if DO_PGADMIN:
     PGA_CODENAMES = {"20": "focal", "22": "jammy", "24": "noble"}
     codename = PGA_CODENAMES.get(major, UBUNTU_NAME)
 
+    # لو الـ key موجود بالفعل نمسحه أولاً عشان gpg ما يسألش
+    run("sudo rm -f /usr/share/keyrings/pgadmin.gpg", check=False)
     run("curl -fsS https://www.pgadmin.org/static/packages_pgadmin_org.pub "
         "| sudo gpg --dearmor -o /usr/share/keyrings/pgadmin.gpg")
     run(f"sudo sh -c 'echo \"deb [signed-by=/usr/share/keyrings/pgadmin.gpg] "
