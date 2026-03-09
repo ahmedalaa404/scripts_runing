@@ -70,19 +70,40 @@ def run(cmd: str, check=True, silent=False, soft=False) -> subprocess.CompletedP
     """
     soft=True  → لو فشل: سجّل في ISSUES وكمّل (بدون sys.exit)
     check=True → لو فشل: sys.exit (السلوك القديم)
+    لو الأمر apt/pip وفشل بسبب النت → ينتظر ويعيد تلقائياً
     """
+    is_network_cmd = any(x in cmd for x in
+                         ["apt ", "apt-get ", "git clone", "curl ", "wget ", "pip install"])
+
     if not silent:
         print(f"\n{C}  ▶  {cmd}{X}\n")
-    r = subprocess.run(cmd, shell=True, executable="/bin/bash",
-                       capture_output=silent)
-    if r.returncode != 0:
-        if silent and r.stderr:
-            print(r.stderr.decode(errors="replace"))
-        if soft:
-            add_issue(f"أمر فشل (سيُكمل): {cmd[:120]}")
-        elif check:
-            err(f"فشل الأمر: {cmd}")
-            sys.exit(1)
+
+    for attempt in range(1, 4):
+        r = subprocess.run(cmd, shell=True, executable="/bin/bash",
+                           capture_output=silent)
+        if r.returncode == 0:
+            return r
+
+        # فشل — نتحقق هل السبب النت؟
+        if is_network_cmd and attempt < 3 and not check_internet():
+            warn(f"فشل (محاولة {attempt}/3) — النت مقطوع، ننتظر ...")
+            if wait_for_internet(cmd[:60]):
+                warn(f"النت رجع — محاولة {attempt + 1}/3 ...")
+                continue
+            else:
+                # المستخدم اختار الخروج من الانتظار
+                break
+        else:
+            break   # فشل بسبب تاني مش النت — وقّف
+
+    # وصلنا هنا يعني فشل نهائي
+    if silent and r.stderr:
+        print(r.stderr.decode(errors="replace"))
+    if soft:
+        add_issue(f"أمر فشل (سيُكمل): {cmd[:120]}")
+    elif check:
+        err(f"فشل الأمر: {cmd}")
+        sys.exit(1)
     return r
 
 def run_ok(cmd: str) -> bool:
@@ -91,6 +112,64 @@ def run_ok(cmd: str) -> bool:
 def capture(cmd: str) -> str:
     return subprocess.run(cmd, shell=True, capture_output=True,
                           text=True).stdout.strip()
+
+def check_internet(timeout: int = 6) -> bool:
+    """تحقق من وجود اتصال بالإنترنت"""
+    r = subprocess.run(
+        f"curl -s --max-time {timeout} https://github.com -o /dev/null -w '%{{http_code}}'",
+        shell=True, capture_output=True, text=True)
+    return r.stdout.strip().startswith("2") or r.stdout.strip().startswith("3")
+
+def wait_for_internet(action: str = ""):
+    """
+    لو النت مش موجود — ينتظر ويحاول كل 15 ثانية.
+    بيعرض رسالة للمستخدم ويديه خيار يكمل أو يوقف.
+    """
+    if check_internet():
+        return True
+    msg = f"انقطع الاتصال بالإنترنت"
+    if action:
+        msg += f" أثناء: {action}"
+    warn(msg)
+    print(f"\n{Y}  ⏳ الانتظار حتى يرجع الإنترنت ...{X}")
+    print(f"  {C}(اضغط Ctrl+C مرتين للخروج){X}\n")
+    attempt = 0
+    while True:
+        time.sleep(15)
+        attempt += 1
+        if check_internet():
+            ok(f"✅ الإنترنت رجع بعد {attempt * 15} ثانية — هنكمل")
+            return True
+        print(f"  {Y}  محاولة {attempt} — لسه مش موجود ...{X}")
+        if attempt % 4 == 0:   # كل دقيقة
+            try:
+                ans = input(
+                    f"\n{B}{Y}  ❓ الإنترنت لسه مقطوع — تكمل الانتظار؟ [Y/n]: {X}"
+                ).strip().lower()
+                if ans == "n":
+                    add_issue(f"تم التخطي بسبب انقطاع النت: {action}")
+                    return False
+            except (KeyboardInterrupt, EOFError):
+                add_issue(f"تم الإيقاف يدوياً أثناء: {action}")
+                return False
+
+def is_clone_complete(odoo_dir: str) -> bool:
+    """
+    تحقق إن الـ clone مكتمل وصالح للاستخدام.
+    لو النت فصل في النص، المجلد بيتعمل لكن ناقص.
+    علامات الـ clone الكامل:
+    - odoo-bin موجود
+    - odoo/__init__.py موجود
+    - requirements.txt موجود
+    - .git موجود وفيه HEAD
+    """
+    checks = [
+        os.path.isfile(os.path.join(odoo_dir, "odoo-bin")),
+        os.path.isfile(os.path.join(odoo_dir, "odoo", "__init__.py")),
+        os.path.isfile(os.path.join(odoo_dir, "requirements.txt")),
+        os.path.isfile(os.path.join(odoo_dir, ".git", "HEAD")),
+    ]
+    return all(checks)
 
 # ═══════════════════════════ Input helpers ════════════════════════
 def ask_yn(q: str, default=None) -> bool:
@@ -243,8 +322,8 @@ def create_venv(py: str, venv_dir: str):
 def base_pip_setup(venv_dir: str, odoo_ver: str):
     """pip upgrade + setuptools fix + psycopg2-binary + build tools"""
     venv_pip(venv_dir, "pip install --upgrade pip wheel")
-    if odoo_ver in ("17.0", "18.0", "19.0"):
-        # ── مشكلة pkg_resources في Odoo 17/18/19 ──
+    if odoo_ver in ("16.0", "17.0", "18.0", "19.0"):
+        # ── مشكلة pkg_resources في Odoo 16/17/18/19 ──
         #
         # السبب: setuptools >= 69 شالت pkg_resources من الـ default path
         # المشكلة بتظهر في **مكانين**:
@@ -254,14 +333,11 @@ def base_pip_setup(venv_dir: str, odoo_ver: str):
         #    بيئة مؤقتة (pip-build-env) بياخد فيها setuptools الجديد
         #    ومش بيورث الـ version اللي في الـ venv
         #
-        # الحل الصح: نثبت setuptools==68.2.2 في الـ venv
-        # وبعدين نستخدم --no-build-isolation عشان الـ build
-        # subprocesses يورثوا الـ venv بتاعنا بدل ما يعملوا بيئة جديدة
+        # الحل: setuptools==68.2.2 + --no-build-isolation
         warn(f"Odoo {odoo_ver}: تثبيت setuptools==68.2.2 (pkg_resources fix)")
         venv_pip(venv_dir, "pip install setuptools==68.2.2")
 
         # تثبيت build dependencies يدوياً عشان --no-build-isolation يشتغل
-        # (no-build-isolation بيتطلب إن كل الـ build tools موجودة مسبقاً)
         venv_pip(venv_dir, "pip install wheel setuptools==68.2.2 "
                            "flit_core pbr hatchling hatch-vcs")
     else:
@@ -310,8 +386,8 @@ CRITICAL_PACKAGES = {
         "MarkupSafe",          # HTML escaping
         "greenlet",            # coroutines
     ],
-    # خاص بـ Odoo 17/18/19
-    "17+": [
+    # خاص بـ Odoo 16/17/18/19
+    "16+": [
         "cbor2",               # CBOR serialization
         "asn1crypto",          # ASN.1 parsing
         "pyOpenSSL",           # SSL
@@ -331,8 +407,8 @@ def verify_and_fix_packages(venv_dir: str, odoo_ver: str):
     section("التحقق من الـ critical packages")
 
     to_install = CRITICAL_PACKAGES["all"][:]
-    if odoo_ver in ("17.0", "18.0", "19.0"):
-        to_install += CRITICAL_PACKAGES["17+"]
+    if odoo_ver in ("16.0", "17.0", "18.0", "19.0"):
+        to_install += CRITICAL_PACKAGES["16+"]
 
     # map: package name → import name
     IMPORT_MAP = {
@@ -421,24 +497,33 @@ def _pip_install_req(venv_dir: str, req_file: str,
                      odoo_ver: str, extra_flags: str = "") -> bool:
     """
     تثبيت requirements مع الـ flags الصح لكل إصدار.
-
-    Odoo 17/18/19 → --no-build-isolation
-        عشان الـ build subprocesses (زي cbor2) يورثوا setuptools==68.2.2
-        من الـ venv بدل ما pip يعمل build env جديد بـ setuptools الجديد
-        اللي مش فيه pkg_resources
-
-    باقي الإصدارات → install عادي
+    Odoo 16/17/18/19 → --no-build-isolation
+    لو فشل بسبب النت → ينتظر ويعيد تلقائياً (حتى 3 مرات)
     """
-    if odoo_ver in ("17.0", "18.0", "19.0"):
+    if odoo_ver in ("16.0", "17.0", "18.0", "19.0"):
         flags = "--no-build-isolation " + extra_flags
     else:
         flags = extra_flags
 
-    r = subprocess.run(
-        f"source {venv_dir}/bin/activate && "
-        f"pip install -r {req_file} {flags}",
-        shell=True, executable="/bin/bash")
-    return r.returncode == 0
+    for attempt in range(1, 4):
+        r = subprocess.run(
+            f"source {venv_dir}/bin/activate && "
+            f"pip install -r {req_file} {flags}",
+            shell=True, executable="/bin/bash")
+        if r.returncode == 0:
+            return True
+
+        # نتحقق هل الفشل بسبب النت؟
+        if attempt < 3:
+            if not check_internet():
+                warn(f"pip فشل (محاولة {attempt}/3) — النت مقطوع، ننتظر ...")
+                if not wait_for_internet(f"pip install requirements Odoo {odoo_ver}"):
+                    return False
+                warn(f"النت رجع — محاولة {attempt + 1}/3 ...")
+            else:
+                # فشل بسبب حاجة تانية مش النت — منتظرش
+                return False
+    return False
 
 def install_requirements(venv_dir: str, req_file: str,
                           odoo_ver: str, py_bin: str,
@@ -490,10 +575,10 @@ def install_requirements(venv_dir: str, req_file: str,
 def pg_create_user(db_user: str, db_pass: str) -> bool:
     """
     إنشاء أو تحديث يوزر في PostgreSQL.
-    يستخدم heredoc بدل -c "..." عشان $$ ما يتفسرش كـ PID من الـ shell.
-    يرجع True لو نجح، False لو فشل (بدون sys.exit).
+    بيكتب SQL في ملف temp وبيشغّله بـ sudo -u postgres psql
+    عشان يستخدم peer authentication (مش password) ويتجنب
+    مشكلة $$ و shell quoting كلها.
     """
-    # heredoc يتجنب مشكلة $$ → PID في الـ shell
     sql = (
         f"DO $body$\n"
         f"BEGIN\n"
@@ -503,77 +588,132 @@ def pg_create_user(db_user: str, db_pass: str) -> bool:
         f"    ALTER  ROLE {db_user} WITH LOGIN CREATEDB PASSWORD '{db_pass}';\n"
         f"  END IF;\n"
         f"END\n"
-        f"$body$;"
+        f"$body$;\n"
     )
-    cmd = f"echo \"{sql}\" | sudo -u postgres psql"
-    r = subprocess.run(cmd, shell=True, executable="/bin/bash",
-                       capture_output=True, text=True)
-    if r.returncode == 0:
-        return True
-    err(f"pg_create_user({db_user}): {r.stderr.strip()[:200]}")
-    return False
+    # نكتب SQL في ملف temp يقدر postgres يقراه
+    sql_file = f"/tmp/pg_create_{db_user}.sql"
+    try:
+        with open(sql_file, "w") as f:
+            f.write(sql)
+        # sudo chmod عشان postgres يقدر يقراه
+        subprocess.run(f"chmod 644 {sql_file}", shell=True)
+        r = subprocess.run(
+            f"sudo -u postgres psql -f {sql_file}",
+            shell=True, capture_output=True, text=True)
+        if r.returncode == 0:
+            return True
+        err(f"pg_create_user({db_user}): {r.stderr.strip()[:200]}")
+        return False
+    finally:
+        # امسح الـ SQL file بعد الاستخدام
+        subprocess.run(f"rm -f {sql_file}", shell=True)
 
 def pg_fix_hba() -> str:
-    """peer → md5 في pg_hba.conf"""
+    """
+    ضبط pg_hba.conf:
+    - local   peer  → md5
+    - host    lines → md5  (أو إضافتهم لو مش موجودين)
+    ده بيضمن إن psql -h localhost يشتغل صح
+    """
     hba = capture(
         "sudo find /etc/postgresql -name pg_hba.conf 2>/dev/null "
         "| sort | tail -1")
     if not hba:
         hba = capture(
             "sudo find /var/lib/pgsql -name pg_hba.conf 2>/dev/null | tail -1")
-    if hba:
-        run(f"sudo sed -i 's/^\\(local.*all.*\\)peer$/\\1md5/' {hba}")
-        run(f"sudo sed -i 's/^\\(local.*postgres.*\\)peer$/\\1md5/' {hba}",
-            check=False)
-        run("sudo systemctl restart postgresql")
-        ok(f"pg_hba.conf → md5  ({hba})")
-    else:
+    if not hba:
         warn("pg_hba.conf مش موجود — auth قد تحتاج ضبط يدوي")
-    return hba or "not found"
+        return "not found"
+
+    # local peer → md5
+    run(f"sudo sed -i 's/^local\\(.*\\)peer$/local\\1md5/' {hba}", check=False)
+    # host scram-sha-256 → md5
+    run(f"sudo sed -i 's/^host\\(.*\\)scram-sha-256$/host\\1md5/' {hba}",
+        check=False)
+
+    # تحقق إن host 127.0.0.1 موجود بـ md5 — لو مش موجود أضفه
+    has_host = capture(
+        f"sudo grep -c '^host.*127.0.0.1.*md5' {hba} 2>/dev/null") or "0"
+    if has_host.strip() == "0":
+        run(f"sudo sh -c 'echo \""
+            f"host    all             all             127.0.0.1/32            md5\n"
+            f"host    all             all             ::1/128                 md5"
+            f"\" >> {hba}'", check=False)
+        ok("أضفنا host md5 lines لـ 127.0.0.1 و ::1")
+
+    run("sudo systemctl restart postgresql")
+    ok(f"pg_hba.conf → md5  ({hba})")
+    return hba
 
 def pg_test_connection(db_user: str, db_pass: str) -> bool:
+    """
+    اختبار الاتصال بـ PostgreSQL.
+    بيجرب -h localhost (md5) ولو فشل بيجرب peer عن طريق postgres
+    """
+    # الطريقة الأساسية: md5 عبر localhost
     r = subprocess.run(
-        f'psql -U {db_user} -h localhost -c "SELECT 1" postgres',
+        f'psql -U {db_user} -h 127.0.0.1 -c "SELECT 1" postgres',
         shell=True, capture_output=True,
         env={**os.environ, "PGPASSWORD": db_pass})
-    return r.returncode == 0
+    if r.returncode == 0:
+        return True
+    # fallback: peer عبر sudo
+    r2 = subprocess.run(
+        f'sudo -u postgres psql -U {db_user} -c "SELECT 1" postgres',
+        shell=True, capture_output=True)
+    return r2.returncode == 0
 
 # ═══════════════════════════ pgAdmin server reg ═══════════════════
 def pgadmin_register_server(name: str, db_user: str, db_pass: str,
                              port: int = 5432):
-    """يضيف سيرفر في pgAdmin4 SQLite DB تلقائياً"""
+    """
+    يضيف سيرفر في pgAdmin4 SQLite DB تلقائياً.
+    بيكتب الـ Python في ملف temp بدل sudo python3 -c "..."
+    عشان يتجنب Syntax error: "(" unexpected من الـ shell
+    """
     pga_db = capture(
         "sudo find /var/lib/pgadmin /home -name 'pgadmin4.db' "
         "2>/dev/null | head -1")
     if not pga_db:
-        warn(f"pgAdmin DB مش موجود — أضف {name} يدوياً (localhost:{port})")
+        warn(f"pgAdmin DB مش موجود — أضف '{name}' يدوياً (localhost:{port})")
         return
 
-    script = f"""
-import sqlite3
-conn = sqlite3.connect('{pga_db}')
-cur  = conn.cursor()
-cur.execute("SELECT COUNT(*) FROM server WHERE name=?", ('{name}',))
-if cur.fetchone()[0] == 0:
-    cur.execute('''INSERT INTO server
-        (user_id,servergroup_id,name,host,port,maintenance_db,
-         username,ssl_mode,connect_timeout,tunnel_port)
-        VALUES (1,1,?,\"localhost\",?,\"postgres\",?,\"prefer\",10,22)''',
-        ('{name}', {port}, '{db_user}'))
-    conn.commit()
-    print('added')
-else:
-    print('exists')
-conn.close()
-"""
-    r = subprocess.run(f'sudo python3 -c "{script}"',
-                       shell=True, capture_output=True, text=True)
-    if "added" in r.stdout:
-        ok(f"pgAdmin: تم إضافة سيرفر '{name}'")
-    elif "exists" in r.stdout:
-        warn(f"pgAdmin: سيرفر '{name}' موجود بالفعل")
-    else:
-        warn(f"pgAdmin register: {r.stderr.strip()[:120]}")
+    # بنكتب script في ملف حقيقي عشان نتجنب shell quoting كاملاً
+    script_path = f"/tmp/pga_reg_{db_user.replace('.','_')}.py"
+    script_lines = [
+        "import sqlite3\n",
+        f"conn = sqlite3.connect(r'{pga_db}')\n",
+        "cur  = conn.cursor()\n",
+        f"cur.execute('SELECT COUNT(*) FROM server WHERE name=?', ('{name}',))\n",
+        "if cur.fetchone()[0] == 0:\n",
+        "    cur.execute(\n",
+        "        'INSERT INTO server '\n",
+        "        '(user_id,servergroup_id,name,host,port,maintenance_db,'\n",
+        "        'username,ssl_mode,connect_timeout,tunnel_port) '\n",
+        "        'VALUES (1,1,?,?,?,?,?,?,?,?)',\n",
+        f"        ('{name}', 'localhost', {port}, 'postgres',\n",
+        f"         '{db_user}', 'prefer', 10, 22)\n",
+        "    )\n",
+        "    conn.commit()\n",
+        "    print('added')\n",
+        "else:\n",
+        "    print('exists')\n",
+        "conn.close()\n",
+    ]
+    try:
+        with open(script_path, "w") as f:
+            f.writelines(script_lines)
+        r = subprocess.run(
+            f"sudo python3 {script_path}",
+            shell=True, capture_output=True, text=True)
+        if "added" in r.stdout:
+            ok(f"pgAdmin: تم إضافة سيرفر '{name}'")
+        elif "exists" in r.stdout:
+            warn(f"pgAdmin: '{name}' موجود بالفعل")
+        else:
+            warn(f"pgAdmin register فشل: {r.stderr.strip()[:120]}")
+    finally:
+        subprocess.run(f"rm -f {script_path}", shell=True)
 
 # ═══════════════════════════ Odoo installer ═══════════════════════
 def install_odoo_version(ver: str, base_path: str,
@@ -613,16 +753,47 @@ def install_odoo_version(ver: str, base_path: str,
 
         # ── Clone ──
         section("Clone")
+        clone_needed = False
         if not os.path.isdir(odoo_dir):
-            r = run(f"git clone https://github.com/odoo/odoo.git "
-                    f"--depth 1 --branch {ver} {odoo_dir}", check=False)
-            if r.returncode != 0:
-                add_issue(f"Odoo {ver}: git clone فشل — "
-                          f"تحقق من الاتصال بالإنترنت")
-                return None
-            ok(f"Clone → {odoo_dir}")
+            clone_needed = True
+        elif not is_clone_complete(odoo_dir):
+            warn(f"{odoo_dir} موجود لكن ناقص (النت فصل في النص؟) — هنمسحه ونعيد")
+            import shutil as _sh
+            _sh.rmtree(odoo_dir, ignore_errors=True)
+            clone_needed = True
         else:
-            warn(f"{odoo_dir} موجود — تخطي clone")
+            warn(f"{odoo_dir} موجود ومكتمل — تخطي clone")
+
+        if clone_needed:
+            # تحقق من النت قبل الـ clone
+            if not wait_for_internet(f"git clone Odoo {ver}"):
+                add_issue(f"Odoo {ver}: تخطي clone بسبب انقطاع النت")
+                return None
+
+            for attempt in range(1, 4):   # 3 محاولات
+                r = run(
+                    f"git clone https://github.com/odoo/odoo.git "
+                    f"--depth 1 --branch {ver} {odoo_dir}",
+                    check=False)
+                if r.returncode == 0 and is_clone_complete(odoo_dir):
+                    ok(f"Clone → {odoo_dir}")
+                    break
+                # فشل أو ناقص
+                if attempt < 3:
+                    warn(f"Clone فشل (محاولة {attempt}/3) — "
+                         f"نتحقق من النت وننتظر ...")
+                    import shutil as _sh
+                    _sh.rmtree(odoo_dir, ignore_errors=True)
+                    if not wait_for_internet(f"إعادة clone Odoo {ver}"):
+                        add_issue(f"Odoo {ver}: فشل clone بعد {attempt} محاولات")
+                        return None
+                else:
+                    add_issue(
+                        f"Odoo {ver}: git clone فشل بعد 3 محاولات — "
+                        f"شغّل يدوياً:\n"
+                        f"     git clone https://github.com/odoo/odoo.git "
+                        f"--depth 1 --branch {ver} {odoo_dir}")
+                    return None
 
         # ── Virtualenv ──
         section("Virtualenv")
