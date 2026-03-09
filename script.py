@@ -241,16 +241,204 @@ def create_venv(py: str, venv_dir: str):
     run(f"{py} -m venv {venv_dir}")
 
 def base_pip_setup(venv_dir: str, odoo_ver: str):
-    """pip upgrade + setuptools fix + psycopg2-binary"""
+    """pip upgrade + setuptools fix + psycopg2-binary + build tools"""
     venv_pip(venv_dir, "pip install --upgrade pip wheel")
     if odoo_ver in ("17.0", "18.0", "19.0"):
-        # setuptools >= 69 شالت pkg_resources من default path
-        # ده بيخلي Odoo 17+ يطلع: ModuleNotFoundError: No module named 'pkg_resources'
-        warn(f"Odoo {odoo_ver}: تثبيت setuptools==68.2.2 لحل pkg_resources error")
+        # ── مشكلة pkg_resources في Odoo 17/18/19 ──
+        #
+        # السبب: setuptools >= 69 شالت pkg_resources من الـ default path
+        # المشكلة بتظهر في **مكانين**:
+        #
+        # 1) في الـ venv مباشرة → نحل بـ setuptools==68.2.2
+        # 2) في الـ pip build subprocess (زي cbor2) → pip بيعمل
+        #    بيئة مؤقتة (pip-build-env) بياخد فيها setuptools الجديد
+        #    ومش بيورث الـ version اللي في الـ venv
+        #
+        # الحل الصح: نثبت setuptools==68.2.2 في الـ venv
+        # وبعدين نستخدم --no-build-isolation عشان الـ build
+        # subprocesses يورثوا الـ venv بتاعنا بدل ما يعملوا بيئة جديدة
+        warn(f"Odoo {odoo_ver}: تثبيت setuptools==68.2.2 (pkg_resources fix)")
         venv_pip(venv_dir, "pip install setuptools==68.2.2")
+
+        # تثبيت build dependencies يدوياً عشان --no-build-isolation يشتغل
+        # (no-build-isolation بيتطلب إن كل الـ build tools موجودة مسبقاً)
+        venv_pip(venv_dir, "pip install wheel setuptools==68.2.2 "
+                           "flit_core pbr hatchling hatch-vcs")
     else:
         venv_pip(venv_dir, "pip install --upgrade setuptools")
     venv_pip(venv_dir, "pip install psycopg2-binary")
+
+
+# ── الـ packages اللي Odoo بيحتاجها دايماً ──
+# بعض الـ packages بتتـ skip أو بتفشل في الـ install العادي
+# وبتظهر كـ ImportError لما Odoo يشتغل
+# ده list شامل مبني على errors حقيقية ظهرت في التثبيت
+CRITICAL_PACKAGES = {
+    # كل الإصدارات
+    "all": [
+        "decorator",           # ImportError: No module named 'decorator'
+        "passlib",             # login issues
+        "babel",               # date/number formatting
+        "lxml",                # XML processing
+        "pillow",              # image processing
+        "python-dateutil",     # date handling
+        "pytz",                # timezone
+        "requests",            # HTTP
+        "werkzeug",            # WSGI
+        "psycopg2-binary",     # PostgreSQL
+        "pydot",               # graph generation
+        "python-stdnum",       # VAT validation
+        "vobject",             # vCard/iCal
+        "xlrd",                # Excel read
+        "xlwt",                # Excel write
+        "PyYAML",              # YAML
+        "chardet",             # encoding detection
+        "cryptography",        # encryption
+        "idna",                # internationalized domain names
+        "urllib3",             # HTTP client
+        "certifi",             # SSL certificates
+        "polib",               # .po translation files
+        "qrcode",              # QR code generation
+        "reportlab",           # PDF generation
+        "pypdf2",              # PDF manipulation
+        "html2text",           # HTML to text
+        "geoip2",              # GeoIP
+        "libsass",             # SASS compiler
+        "num2words",           # numbers to words
+        "ofxparse",            # OFX financial files
+        "Jinja2",              # templating
+        "MarkupSafe",          # HTML escaping
+        "greenlet",            # coroutines
+    ],
+    # خاص بـ Odoo 17/18/19
+    "17+": [
+        "cbor2",               # CBOR serialization
+        "asn1crypto",          # ASN.1 parsing
+        "pyOpenSSL",           # SSL
+        "freezegun",           # time mocking (tests)
+        "stdnum",              # alias for python-stdnum
+        "rjsmin",              # JS minification
+        "cssselect",           # CSS selectors
+    ],
+}
+
+def verify_and_fix_packages(venv_dir: str, odoo_ver: str):
+    """
+    بعد تثبيت الـ requirements، بيتحقق إن كل الـ critical packages
+    موجودة فعلاً — في call واحد بدل ما يعمل call لكل package.
+    لو في حاجة ناقصة بيثبتها مباشرة.
+    """
+    section("التحقق من الـ critical packages")
+
+    to_install = CRITICAL_PACKAGES["all"][:]
+    if odoo_ver in ("17.0", "18.0", "19.0"):
+        to_install += CRITICAL_PACKAGES["17+"]
+
+    # map: package name → import name
+    IMPORT_MAP = {
+        "pillow":           "PIL",
+        "pyyaml":           "yaml",
+        "pypdf2":           "PyPDF2",
+        "pyopenssl":        "OpenSSL",
+        "psycopg2-binary":  "psycopg2",
+        "python-dateutil":  "dateutil",
+        "python-stdnum":    "stdnum",
+        "werkzeug":         "werkzeug",
+        "libsass":          "sass",
+        "markupsafe":       "markupsafe",
+        "jinja2":           "jinja2",
+    }
+
+    # بناء script بيعمل import لكل الـ packages دفعة واحدة
+    # وبيرجع list بالناقصين على stdout
+    checks = []
+    for pkg in to_install:
+        key  = pkg.lower()
+        iname = IMPORT_MAP.get(key, key.replace("-", "_"))
+        checks.append(f"('{pkg}', '{iname}')")
+
+    check_script = (
+        "import sys\n"
+        "missing = []\n"
+        f"pairs = [{', '.join(checks)}]\n"
+        "for pkg, mod in pairs:\n"
+        "    try:\n"
+        "        __import__(mod)\n"
+        "    except ImportError:\n"
+        "        missing.append(pkg)\n"
+        "print('|'.join(missing))"
+    )
+
+    r = subprocess.run(
+        f"source {venv_dir}/bin/activate && python -c \"{check_script}\"",
+        shell=True, executable="/bin/bash",
+        capture_output=True, text=True)
+
+    raw = r.stdout.strip()
+    missing = [p for p in raw.split("|") if p]
+
+    if not missing:
+        ok("كل الـ critical packages موجودة ✔")
+        return
+
+    warn(f"packages ناقصة ({len(missing)}): {', '.join(missing)}")
+
+    # ثبّت الناقصين دفعة واحدة أولاً
+    pkgs_str = " ".join(f'"{p}"' for p in missing)
+    r2 = subprocess.run(
+        f"source {venv_dir}/bin/activate && "
+        f"pip install {pkgs_str} --no-build-isolation",
+        shell=True, executable="/bin/bash")
+
+    if r2.returncode == 0:
+        ok(f"تم تثبيت {len(missing)} packages ناقصة ✔")
+        return
+
+    # لو فشلت دفعة — جرّب كل package لوحده
+    failed = []
+    for pkg in missing:
+        r3 = subprocess.run(
+            f"source {venv_dir}/bin/activate && "
+            f"pip install \"{pkg}\" --no-build-isolation",
+            shell=True, executable="/bin/bash", capture_output=True)
+        if r3.returncode == 0:
+            ok(f"  ✅ {pkg}")
+        else:
+            failed.append(pkg)
+            warn(f"  ❌ {pkg} فشل")
+
+    if failed:
+        add_issue(
+            f"Odoo {odoo_ver}: packages ناقصة فشل تثبيتها — شغّل يدوياً:\n"
+            + "\n".join(
+                f"     source {venv_dir}/bin/activate && "
+                f"pip install \"{p}\"" for p in failed
+            )
+        )
+
+
+def _pip_install_req(venv_dir: str, req_file: str,
+                     odoo_ver: str, extra_flags: str = "") -> bool:
+    """
+    تثبيت requirements مع الـ flags الصح لكل إصدار.
+
+    Odoo 17/18/19 → --no-build-isolation
+        عشان الـ build subprocesses (زي cbor2) يورثوا setuptools==68.2.2
+        من الـ venv بدل ما pip يعمل build env جديد بـ setuptools الجديد
+        اللي مش فيه pkg_resources
+
+    باقي الإصدارات → install عادي
+    """
+    if odoo_ver in ("17.0", "18.0", "19.0"):
+        flags = "--no-build-isolation " + extra_flags
+    else:
+        flags = extra_flags
+
+    r = subprocess.run(
+        f"source {venv_dir}/bin/activate && "
+        f"pip install -r {req_file} {flags}",
+        shell=True, executable="/bin/bash")
+    return r.returncode == 0
 
 def install_requirements(venv_dir: str, req_file: str,
                           odoo_ver: str, py_bin: str,
@@ -258,43 +446,44 @@ def install_requirements(venv_dir: str, req_file: str,
     base_pip_setup(venv_dir, odoo_ver)
 
     section("تثبيت requirements.txt")
-    r = subprocess.run(
-        f"source {venv_dir}/bin/activate && pip install -r {req_file}",
-        shell=True, executable="/bin/bash")
 
-    if r.returncode == 0:
+    # المحاولة الأولى — مع --no-build-isolation لـ Odoo 17/18/19
+    if _pip_install_req(venv_dir, req_file, odoo_ver):
         ok("تم تثبيت كل الـ requirements")
-        return py_bin
+    else:
+        # المحاولة الثانية — مع --ignore-requires-python برضو
+        warn("المحاولة الأولى فشلت — هنجرب مع --ignore-requires-python")
+        if _pip_install_req(venv_dir, req_file, odoo_ver,
+                            "--ignore-requires-python"):
+            ok("requirements تم (مع ignore pins)")
+        elif odoo_ver == "15.0" and py_bin == "python3.8":
+            # Odoo 15 fallback: امسح venv وأعد بـ 3.9
+            warn("Odoo 15 + 3.8 فشل — بنعيد البناء بـ python3.9")
+            shutil.rmtree(venv_dir, ignore_errors=True)
+            if install_python_bin("python3.9", ubuntu_ver):
+                create_venv("python3.9", venv_dir)
+                base_pip_setup(venv_dir, odoo_ver)
+                if _pip_install_req(venv_dir, req_file, odoo_ver,
+                                    "--ignore-requires-python"):
+                    ok("تم إعادة البناء بـ python3.9")
+                    py_bin = "python3.9"
+                else:
+                    add_issue(
+                        f"Odoo {odoo_ver}: فشل requirements حتى مع python3.9")
+            else:
+                add_issue(f"Odoo {odoo_ver}: فشل تثبيت python3.9")
+        else:
+            add_issue(
+                f"Odoo {odoo_ver}: فشل تثبيت requirements — شغّل يدوياً:\n"
+                f"     source {venv_dir}/bin/activate\n"
+                f"     pip install setuptools==68.2.2\n"
+                f"     pip install -r {req_file} --no-build-isolation")
 
-    warn("المحاولة الأولى فشلت — هنجرب --ignore-requires-python")
-    r2 = subprocess.run(
-        f"source {venv_dir}/bin/activate && "
-        f"pip install -r {req_file} --ignore-requires-python",
-        shell=True, executable="/bin/bash")
-    if r2.returncode == 0:
-        ok("requirements تم (مع ignore pins)")
-        return py_bin
+    # ── التحقق من الـ critical packages بعد الـ requirements ──
+    # حتى لو الـ requirements اتثبتت، في packages ممكن تكون اتـ skip
+    # أو فشلت بصمت وبتطلع ImportError لما Odoo يشتغل (زي decorator)
+    verify_and_fix_packages(venv_dir, odoo_ver)
 
-    # Odoo 15 fallback: امسح venv وأعد بـ 3.9
-    if odoo_ver == "15.0" and py_bin == "python3.8":
-        warn("Odoo 15 + 3.8 فشل — بنعيد البناء بـ python3.9")
-        shutil.rmtree(venv_dir, ignore_errors=True)
-        if install_python_bin("python3.9", ubuntu_ver):
-            create_venv("python3.9", venv_dir)
-            base_pip_setup(venv_dir, odoo_ver)
-            r3 = subprocess.run(
-                f"source {venv_dir}/bin/activate && "
-                f"pip install -r {req_file} --ignore-requires-python",
-                shell=True, executable="/bin/bash")
-            if r3.returncode == 0:
-                ok("تم إعادة البناء بـ python3.9")
-                return "python3.9"
-        add_issue(f"Odoo {odoo_ver}: فشل تثبيت requirements حتى مع python3.9")
-        return py_bin
-
-    add_issue(f"Odoo {odoo_ver}: فشل تثبيت requirements — "
-              f"شغّل يدوياً: source {venv_dir}/bin/activate && "
-              f"pip install -r {req_file}")
     return py_bin
 
 # ═══════════════════════════ PostgreSQL helpers ═══════════════════
