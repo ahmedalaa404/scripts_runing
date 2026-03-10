@@ -15,11 +15,11 @@
 ╚════════════════════════════════════════════════════════════════╝
 
 Python per Odoo version:
-  15 → 3.8  (fallback 3.9 — venv rebuilt auto on failure)
-  16 → 3.10
-  17 → 3.11  + setuptools==68.2.2 fix
-  18 → 3.11  + setuptools==68.2.2 fix
-  19 → 3.11  + setuptools==68.2.2 fix
+  15 → 3.8  (مستقر — بدون fallback)
+  16 → 3.11  +  setuptools==68.2.2 fix
+  17 → 3.11  +  setuptools==68.2.2 fix
+  18 → 3.11  +  setuptools==68.2.2 fix
+  19 → 3.11  +  setuptools==68.2.2 fix
 """
 
 import subprocess, os, sys, getpass, datetime, shutil, time
@@ -230,8 +230,8 @@ def ask_path(prompt: str, default: str) -> str:
 # ═══════════════════════════ Constants ═══════════════════════════
 PYTHON_MATRIX = {
     # version: (primary, fallback, note)
-    "15.0": ("python3.8",  "python3.9",  "3.8 / fallback 3.9"),
-    "16.0": ("python3.10", "python3.10", "3.10 stable"),
+    "15.0": ("python3.8",  "python3.8",  "3.8 stable — الأنسب لـ Odoo 15"),
+    "16.0": ("python3.11", "python3.11", "3.11 + setuptools fix"),
     "17.0": ("python3.11", "python3.11", "3.11 + setuptools fix"),
     "18.0": ("python3.11", "python3.11", "3.11 + setuptools fix"),
     "19.0": ("python3.11", "python3.11", "3.11 + setuptools fix"),
@@ -541,22 +541,6 @@ def install_requirements(venv_dir: str, req_file: str,
         if _pip_install_req(venv_dir, req_file, odoo_ver,
                             "--ignore-requires-python"):
             ok("requirements تم (مع ignore pins)")
-        elif odoo_ver == "15.0" and py_bin == "python3.8":
-            # Odoo 15 fallback: امسح venv وأعد بـ 3.9
-            warn("Odoo 15 + 3.8 فشل — بنعيد البناء بـ python3.9")
-            shutil.rmtree(venv_dir, ignore_errors=True)
-            if install_python_bin("python3.9", ubuntu_ver):
-                create_venv("python3.9", venv_dir)
-                base_pip_setup(venv_dir, odoo_ver)
-                if _pip_install_req(venv_dir, req_file, odoo_ver,
-                                    "--ignore-requires-python"):
-                    ok("تم إعادة البناء بـ python3.9")
-                    py_bin = "python3.9"
-                else:
-                    add_issue(
-                        f"Odoo {odoo_ver}: فشل requirements حتى مع python3.9")
-            else:
-                add_issue(f"Odoo {odoo_ver}: فشل تثبيت python3.9")
         else:
             add_issue(
                 f"Odoo {odoo_ver}: فشل تثبيت requirements — شغّل يدوياً:\n"
@@ -862,48 +846,22 @@ def install_odoo_version(ver: str, base_path: str,
         run(f"sudo chmod 644 {logrotate_path}", soft=True)
         ok(f"logrotate → {logrotate_path}  (daily, 30 days, compressed)")
 
-        # ── systemd service ──
-        section(f"systemd service: {service}")
-        svc_content = (
-            f"[Unit]\n"
-            f"Description=Odoo {ver}\n"
-            f"After=network.target postgresql.service\n\n"
-            f"[Service]\n"
-            f"Type=simple\n"
-            f"User={CURRENT_USER}\n"
-            f"WorkingDirectory={odoo_dir}\n"
-            f"ExecStart={venv_dir}/bin/python {odoo_dir}/odoo-bin "
-            f"-c {conf_file}\n"
-            f"Restart=on-failure\n"
-            f"RestartSec=5\n"
-            f"StandardOutput=journal\n"
-            f"StandardError=journal\n\n"
-            f"[Install]\n"
-            f"WantedBy=multi-user.target\n"
-        )
-        tmp_svc = f"/tmp/{service}.service"
-        with open(tmp_svc, "w") as f:
-            f.write(svc_content)
-        run(f"sudo mv {tmp_svc} /etc/systemd/system/{service}.service", soft=True)
-        run("sudo systemctl daemon-reload", soft=True)
-        run(f"sudo systemctl enable {service}", soft=True)
-        run(f"sudo systemctl start {service}", soft=True)
+        # ── تعليمات التشغيل اليدوي ──
+        # بيئة تطوير — مش محتاج service دايم شغال
+        # شغّل Odoo يدوياً لما تحتاجه من PyCharm أو Terminal
+        section("تعليمات التشغيل")
+        ok(f"Odoo {ver} جاهز ✔")
+        print(f"\n  {C}لتشغيل Odoo {ver}:{X}")
+        print(f"  {Y}  source {venv_dir}/bin/activate{X}")
+        print(f"  {Y}  python {odoo_dir}/odoo-bin -c {conf_file}{X}")
+        print(f"  {C}  ثم افتح: http://localhost:{port}{X}\n")
 
-        time.sleep(4)
-        status = capture(f"sudo systemctl is-active {service}")
-        if status == "active":
-            ok(f"Odoo {ver} شغال ✔  → http://localhost:{port}")
-        else:
-            add_issue(f"Odoo {ver}: service status='{status}' — "
-                      f"راجع: sudo journalctl -u {service} -f")
-
-        run(f"sudo systemctl status {service} --no-pager", check=False)
-
+        status = "ready"
         return {
             "ver": ver, "py_bin": py_bin, "port": port,
             "odoo_dir": odoo_dir, "venv_dir": venv_dir,
             "conf_file": conf_file, "log_file": log_file,
-            "service": service, "db_user": db_user, "db_pass": db_pass,
+            "service": None, "db_user": db_user, "db_pass": db_pass,
             "status": status,
         }
 
@@ -1196,18 +1154,15 @@ for d in installed_info:
 │  Python       : {d['py_bin']}
 │  Source dir   : {d['odoo_dir']}
 │  Virtualenv   : {d['venv_dir']}
-│  Config file  : {d['conf_file']}  ← داخل الـ clone
+│  Config file  : {d['conf_file']}
 │  Log file     : {d['log_file']}
-│  Service      : {d['service']}
-│  Status       : {d['status']}
 └{'─'*56}
-  sudo systemctl start   {d['service']}
-  sudo systemctl stop    {d['service']}
-  sudo systemctl restart {d['service']}
-  sudo journalctl -u {d['service']} -f
-  # debug manual:
+  # ▶ تشغيل Odoo {d['ver']}:
   source {d['venv_dir']}/bin/activate
   python {d['odoo_dir']}/odoo-bin -c {d['conf_file']}
+
+  # ▶ أو مع dev mode:
+  python {d['odoo_dir']}/odoo-bin -c {d['conf_file']} --dev=all
 """
 
 pg_block = ""
@@ -1258,8 +1213,8 @@ User    : {CURRENT_USER}
 {'═'*60}
  Python Version Policy
 {'═'*60}
-  Odoo 15 → python3.8  (fallback 3.9, venv rebuilt auto)
-  Odoo 16 → python3.10
+  Odoo 15 → python3.8   (مستقر — الأنسب لـ Odoo 15)
+  Odoo 16 → python3.11  +  setuptools==68.2.2  (pkg_resources fix)
   Odoo 17 → python3.11  +  setuptools==68.2.2  (pkg_resources fix)
   Odoo 18 → python3.11  +  setuptools==68.2.2  (pkg_resources fix)
   Odoo 19 → python3.11  +  setuptools==68.2.2  (pkg_resources fix)
