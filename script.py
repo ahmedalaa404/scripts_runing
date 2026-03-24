@@ -40,6 +40,33 @@ def add_issue(msg: str):
     ISSUES.append(msg)
     err(f"[مشكلة سُجّلت] {msg}")
 
+# ═══════════════════════════ Progress ════════════════════════════
+_PROGRESS_TOTAL = 0
+_PROGRESS_DONE  = 0
+_PROGRESS_LABEL = ""
+
+def progress_init(total: int):
+    """حدد عدد الخطوات الكلي في بداية السكريبت"""
+    global _PROGRESS_TOTAL, _PROGRESS_DONE
+    _PROGRESS_TOTAL = total
+    _PROGRESS_DONE  = 0
+
+def progress_step(label: str):
+    """اتصل بيه في بداية كل خطوة كبيرة"""
+    global _PROGRESS_DONE, _PROGRESS_LABEL
+    _PROGRESS_DONE += 1
+    _PROGRESS_LABEL = label
+    pct = int(_PROGRESS_DONE / _PROGRESS_TOTAL * 100) if _PROGRESS_TOTAL else 0
+    print(f"\n{B}{'═'*60}")
+    print(f"  📊 {pct}%  ({_PROGRESS_DONE}/{_PROGRESS_TOTAL})  —  {label}")
+    print(f"{'═'*60}{X}")
+
+def progress_done():
+    """اطبع 100% في النهاية"""
+    print(f"\n{G}{'═'*60}")
+    print(f"  📊 100%  —  اكتمل التثبيت ✔")
+    print(f"{'═'*60}{X}\n")
+
 # ═══════════════════════════ Logging ═════════════════════════════
 def title(msg):
     sep = "═" * 60
@@ -314,6 +341,9 @@ def ensure_python(odoo_ver: str, ubuntu_ver: str) -> str | None:
 
 # ═══════════════════════════ Venv & pip ══════════════════════════
 def venv_pip(venv_dir: str, cmd: str):
+    # --prefer-binary → يجيب wheel جاهز بدل compile (أسرع بكتير لـ lxml/Pillow/cbor2)
+    if "pip install" in cmd and "--prefer-binary" not in cmd:
+        cmd = cmd.replace("pip install", "pip install --prefer-binary")
     run(f"source {venv_dir}/bin/activate && {cmd}")
 
 def create_venv(py: str, venv_dir: str):
@@ -508,7 +538,7 @@ def _pip_install_req(venv_dir: str, req_file: str,
     for attempt in range(1, 4):
         r = subprocess.run(
             f"source {venv_dir}/bin/activate && "
-            f"pip install -r {req_file} {flags}",
+            f"pip install --prefer-binary -r {req_file} {flags}",
             shell=True, executable="/bin/bash")
         if r.returncode == 0:
             return True
@@ -757,7 +787,7 @@ def install_odoo_version(ver: str, base_path: str,
             for attempt in range(1, 4):   # 3 محاولات
                 r = run(
                     f"git clone https://github.com/odoo/odoo.git "
-                    f"--depth 1 --branch {ver} {odoo_dir}",
+                    f"--depth 1 --single-branch --branch {ver} {odoo_dir}",
                     check=False)
                 if r.returncode == 0 and is_clone_complete(odoo_dir):
                     ok(f"Clone → {odoo_dir}")
@@ -928,9 +958,14 @@ if not ask_yn("\nتأكيد — تكمل؟", default=True):
     print("  تم الإلغاء.")
     sys.exit(0)
 
+# ── حساب عدد الخطوات الكلي عشان نحسب النسبة صح ──
+_steps = sum([DO_SYSTEM, DO_POSTGRES, DO_PGADMIN,
+              len(chosen_versions) if DO_ODOO else 0]) + 1  # +1 للفحص النهائي
+progress_init(_steps)
+
 # ═══════════════════════ Step 1: System Deps ═════════════════════
 if DO_SYSTEM:
-    title("📦 الحزم الأساسية  (بدون apt upgrade)")
+    progress_step("تثبيت الحزم الأساسية")
     run("sudo apt-get update -q")
     run("sudo apt-get install -y git wget curl build-essential "
         "software-properties-common gnupg2 lsb-release ca-certificates")
@@ -967,6 +1002,7 @@ else:
 PG_HBA = "not found"
 
 if DO_POSTGRES:
+    progress_step("تثبيت PostgreSQL")
     title("🐘 PostgreSQL")
     run("sudo apt-get install -y postgresql postgresql-contrib")
     run("sudo systemctl enable postgresql --now")
@@ -1000,6 +1036,7 @@ else:
 
 # ═══════════════════════ Step 3: pgAdmin 4 ═══════════════════════
 if DO_PGADMIN:
+    progress_step("تثبيت pgAdmin 4")
     title("🖥️  pgAdmin 4")
     major = UBUNTU_VER.split(".")[0]
 
@@ -1052,6 +1089,7 @@ if DO_ODOO:
     os.makedirs(BASE_PATH, exist_ok=True)
 
     for ver in chosen_versions:
+        progress_step(f"تثبيت Odoo {ver}")
         info_dict = install_odoo_version(
             ver, BASE_PATH, UBUNTU_VER, UBUNTU_NAME, installed_info)
 
@@ -1085,6 +1123,7 @@ else:
 
 # ═══════════════ آخر خطوة: فحص DB users في PostgreSQL ═══════════
 # ده بيتعمل في الآخر خالص بعد انتهاء كل حاجة
+progress_step("الفحص النهائي — التحقق من DB users")
 title("🔍 فحص نهائي — التحقق من DB users في PostgreSQL")
 
 DB_CHECK_RESULTS = []
@@ -1235,6 +1274,7 @@ if DO_PGADMIN:
     print(f"  ✅ pgAdmin     → {G}http://localhost/pgadmin4{X}"
           f"  ({PGA_EMAIL})")
 
+progress_done()
 print(f"\n  {Y}📄 Report → {REPORT_PATH}{X}")
 print(f"  {C}cat {REPORT_PATH}{X}\n")
 
